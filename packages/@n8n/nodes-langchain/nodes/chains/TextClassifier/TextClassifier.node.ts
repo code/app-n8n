@@ -21,11 +21,11 @@ const SYSTEM_PROMPT_TEMPLATE =
 
 const configuredOutputs = (parameters: INodeParameters) => {
 	const categories = ((parameters.categories as IDataObject)?.categories as IDataObject[]) ?? [];
-	const fallback = (parameters.options as IDataObject)?.fallback as boolean;
+	const fallback = (parameters.options as IDataObject)?.fallback as string;
 	const ret = categories.map((cat) => {
 		return { type: NodeConnectionType.Main, displayName: cat.category };
 	});
-	if (fallback) ret.push({ type: NodeConnectionType.Main, displayName: 'Other' });
+	if (fallback === 'other') ret.push({ type: NodeConnectionType.Main, displayName: 'Other' });
 	return ret;
 };
 
@@ -34,6 +34,7 @@ export class TextClassifier implements INodeType {
 		displayName: 'Text Classifier',
 		name: 'textClassifier',
 		icon: 'fa:tags',
+		iconColor: 'black',
 		group: ['transform'],
 		version: 1,
 		description: 'Classify your text into distinct categories',
@@ -45,7 +46,7 @@ export class TextClassifier implements INodeType {
 			resources: {
 				primaryDocumentation: [
 					{
-						url: 'https://docs.n8n.io/integrations/builtin/cluster-nodes/root-nodes/n8n-nodes-langchain.chainllm/',
+						url: 'https://docs.n8n.io/integrations/builtin/cluster-nodes/root-nodes/n8n-nodes-langchain.text-classifier/',
 					},
 				],
 			},
@@ -122,11 +123,23 @@ export class TextClassifier implements INodeType {
 						default: false,
 					},
 					{
-						displayName: 'Add Fallback Option',
+						displayName: 'When No Clear Match',
 						name: 'fallback',
-						type: 'boolean',
-						default: false,
-						description: 'Whether to add a "fallback" option if no other categories match',
+						type: 'options',
+						default: 'discard',
+						description: 'What to do with items that don’t match the categories exactly',
+						options: [
+							{
+								name: 'Discard Item',
+								value: 'discard',
+								description: 'Ignore the item and drop it from the output',
+							},
+							{
+								name: "Output on Extra, 'Other' Branch",
+								value: 'other',
+								description: "Create a separate output branch called 'Other'",
+							},
+						],
 					},
 					{
 						displayName: 'System Prompt Template',
@@ -158,11 +171,11 @@ export class TextClassifier implements INodeType {
 
 		const options = this.getNodeParameter('options', 0, {}) as {
 			multiClass: boolean;
-			fallback: boolean;
+			fallback?: string;
 			systemPromptTemplate?: string;
 		};
 		const multiClass = options?.multiClass ?? false;
-		const fallback = options?.fallback ?? false;
+		const fallback = options?.fallback ?? 'discard';
 
 		const schemaEntries = categories.map((cat) => [
 			cat.category,
@@ -172,7 +185,7 @@ export class TextClassifier implements INodeType {
 					`Should be true if the input has category "${cat.category}" (description: ${cat.description})`,
 				),
 		]);
-		if (fallback)
+		if (fallback === 'other')
 			schemaEntries.push([
 				'fallback',
 				z.boolean().describe('Should be true if none of the other categories apply'),
@@ -184,24 +197,33 @@ export class TextClassifier implements INodeType {
 		const multiClassPrompt = multiClass
 			? 'Categories are not mutually exclusive, and multiple can be true'
 			: 'Categories are mutually exclusive, and only one can be true';
-		const fallbackPrompt = fallback
-			? 'If no categories apply, select the "fallback" option.'
-			: 'One of the options must always be true.';
 
-		const systemPromptTemplate = SystemMessagePromptTemplate.fromTemplate(
-			`${options.systemPromptTemplate ?? SYSTEM_PROMPT_TEMPLATE}
-{format_instructions}
-${multiClassPrompt}
-${fallbackPrompt}`,
-		);
+		const fallbackPrompt = {
+			other: 'If no categories apply, select the "fallback" option.',
+			discard: 'If there is not a very fitting category, select none of the categories.',
+		}[fallback];
 
 		const returnData: INodeExecutionData[][] = Array.from(
-			{ length: categories.length + (fallback ? 1 : 0) },
+			{ length: categories.length + (fallback === 'other' ? 1 : 0) },
 			(_) => [],
 		);
 		for (let itemIdx = 0; itemIdx < items.length; itemIdx++) {
+			const item = items[itemIdx];
+			item.pairedItem = { item: itemIdx };
 			const input = this.getNodeParameter('inputText', itemIdx) as string;
 			const inputPrompt = new HumanMessage(input);
+
+			const systemPromptTemplateOpt = this.getNodeParameter(
+				'options.systemPromptTemplate',
+				itemIdx,
+			) as string;
+			const systemPromptTemplate = SystemMessagePromptTemplate.fromTemplate(
+				`${systemPromptTemplateOpt ?? SYSTEM_PROMPT_TEMPLATE}
+{format_instructions}
+${multiClassPrompt}
+${fallbackPrompt}`,
+			);
+
 			const messages = [
 				await systemPromptTemplate.format({
 					categories: categories.map((cat) => cat.category).join(', '),
@@ -212,12 +234,27 @@ ${fallbackPrompt}`,
 			const prompt = ChatPromptTemplate.fromMessages(messages);
 			const chain = prompt.pipe(llm).pipe(parser).withConfig(getTracingConfig(this));
 
-			const output = await chain.invoke(messages);
-			categories.forEach((cat, idx) => {
-				if (output[cat.category]) returnData[idx].push(items[itemIdx]);
-			});
-			if (fallback && output.fallback) returnData[returnData.length - 1].push(items[itemIdx]);
+			try {
+				const output = await chain.invoke(messages);
+
+				categories.forEach((cat, idx) => {
+					if (output[cat.category]) returnData[idx].push(item);
+				});
+				if (fallback === 'other' && output.fallback) returnData[returnData.length - 1].push(item);
+			} catch (error) {
+				if (this.continueOnFail(error)) {
+					returnData[0].push({
+						json: { error: error.message },
+						pairedItem: { item: itemIdx },
+					});
+
+					continue;
+				}
+
+				throw error;
+			}
 		}
+
 		return returnData;
 	}
 }
